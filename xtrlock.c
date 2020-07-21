@@ -79,23 +79,24 @@ typedef enum State_ {
 Display *display = NULL;
 Window window, root;
 cmndline_parameters parameters = {
-		.modes = 0x0
+    .modes = 0x0
 };
 
-State nextState(const State state) {
-	State next = Idle;
-	switch(state) {
-	case Idle:
-		next = LoginName;
-		break;
-	case LoginName:
-		next = Password;
-		break;
-	case Password:
-		next = Idle;
-		break;
-	}
-	return next;
+State nextState(const State state)
+{
+    State next = Idle;
+    switch(state) {
+    case Idle:
+        next = LoginName;
+        break;
+    case LoginName:
+        next = Password;
+        break;
+    case Password:
+        next = Idle;
+        break;
+    }
+    return next;
 }
 
 #define resetState() \
@@ -105,13 +106,14 @@ State nextState(const State state) {
     set_cursor(display, (event_mask)&0,programState);
 
 
-static inline const char * stateToString(const State state) {
+static inline const char * stateToString(const State state)
+{
 #define X(s,b) case s: return TO_STRING(s);
-	switch(state) {
-	STATE_TABLE
-	}
+    switch(state) {
+        STATE_TABLE
+    }
 #undef X
-	return "";
+    return "";
 }
 
 #define TIMEOUTPERATTEMPT 30000
@@ -119,114 +121,123 @@ static inline const char * stateToString(const State state) {
 #define INITIALGOODWILL MAXGOODWILL
 #define GOODWILLPORTION 0.3
 
-static char *get_username(void)
+static char *get_username(char *buffer, const size_t size)
 {
-  uid_t uid = getuid();
-  char *username = NULL;
+    const uid_t uid = getuid();
+    const char *username = NULL;
 
-  /* Get the user name from the environment if started as root. */
-  if (uid == 0)
-    username = getenv("USER");
+    /* Get the user name from the environment if started as root. */
+    if (uid == 0) {
+        username = getenv("USER");
+    }
 
-  if (username == NULL) {
-    struct passwd *pw;
+    if (username == NULL) {
+        struct passwd *pw = getpwuid(uid); /* Get the password entry. */
 
-    /* Get the password entry. */
-    pw = getpwuid(uid);
+        if (pw == NULL) {
+            syslog(LOG_WARNING,"Passw ord entry not found for user %u",uid);
+            return NULL;
+        }
 
-    if (pw == NULL)
-      return NULL;
+        username = pw->pw_name;
+    }
 
-    username = pw->pw_name;
-  }
-
-  return strdup(username);
+    if ((buffer) && (strlen(username) < size)) {
+        strcpy(buffer,username);
+        return buffer;
+    } else {
+        return strdup(username);
+    }
 }
 
 int log_session_access(const char *newuser,Bool success)
 {
-  int error = EXIT_SUCCESS;
-  uid_t uid = getuid();
-  char *username = NULL;
-  char buffer[100];
+    int error = EXIT_SUCCESS;
+    uid_t uid = getuid();
+    char *username = NULL;
+    char buffer[100];
 
-  /* Get the user name from the environment if started as root. */
-  if (uid == 0)
-    username = getenv("USER");
+    /* Get the user name from the environment if started as root. */
+    if (uid == 0)
+        username = getenv("USER");
 
-  if (username == NULL) {
-    struct passwd *pw;
+    if (username == NULL) {
+        struct passwd *pw;
 
-    /* Get the password entry. */
-    pw = getpwuid(uid);
+        /* Get the password entry. */
+        pw = getpwuid(uid);
 
-    if (pw != NULL) {
-      username = pw->pw_name;
-    } else {
-      error = ENOENT;
-      sprintf(buffer,"(%u)",uid);
-      username = buffer;
+        if (pw != NULL) {
+            username = pw->pw_name;
+        } else {
+            error = ENOENT;
+            sprintf(buffer,"(%u)",uid);
+            username = buffer;
+        }
     }
-  }
 
-  if (!newuser) {
-	newuser = "???";
-  }
+    if (!newuser) {
+        newuser = "???";
+    }
 
-  if (success) {
-    syslog(LOG_NOTICE,"user %s entering into %s's session",newuser,username);
-  } else {
-    syslog(LOG_ERR,"user %s authentication has failed to enter into %s's session",newuser,username);
-  }
+    if (success) {
+        syslog(LOG_NOTICE,"user %s entering into %s's session",newuser,username);
+    } else {
+        syslog(LOG_ERR,"user %s authentication has failed to enter into %s's session",newuser,username);
+    }
 
-  return error;
+    return error;
 }
 
 static inline void log_session_lock()
 {
-  uid_t uid = getuid();
-  char *username = NULL;
-  char buffer[16];
+    uid_t uid = getuid();
+    char *username = NULL;
+    char buffer[16];
 
-  /* Get the user name from the environment if started as root. */
-  if (uid == 0)
-    username = getenv("USER");
+    /* Get the user name from the environment if started as root. */
+    if (uid == 0)
+        username = getenv("USER");
 
-  if (username == NULL) {
-    struct passwd *pw;
+    if (username == NULL) {
+        struct passwd *pw;
 
-    /* Get the password entry. */
-    pw = getpwuid(uid);
+        /* Get the password entry. */
+        pw = getpwuid(uid);
 
-    if (pw != NULL) {
-      username = pw->pw_name;
-    } else {
-      sprintf(buffer,"(%u)",uid);
-      username = buffer;
+        if (pw != NULL) {
+            username = pw->pw_name;
+        } else {
+            sprintf(buffer,"(%u)",uid);
+            username = buffer;
+        }
     }
-  }
 
-  const char *mode = "mono-user";
-  if ((parameters.modes & e_MultiUsers) == e_MultiUsers) {
-    mode = "multi-users";
-  }
-  syslog(LOG_NOTICE,"User %s's session is now locked (%s)",username,mode);
+    const char *mode = "mono-user";
+    if ((parameters.modes & e_MultiUsers) == e_MultiUsers) {
+        mode = "multi-users";
+    }
+    syslog(LOG_NOTICE,"User %s's session is now locked (%s)",username,mode);
 }
 
-static void onExit(void) {
-	if (display) {
-		XUngrabKeyboard(display,CurrentTime);
-		syslog(LOG_DEBUG,"exit XUngrabKeyboard");
-		XFlush(display);
-		sleep(1);
-		XCloseDisplay(display);
-	}
-	syslog(LOG_NOTICE,"xtrlock ended");
+static void onExit(void)
+{
+    if (display) {
+        XUngrabKeyboard(display,CurrentTime);
+        syslog(LOG_DEBUG,"exit XUngrabKeyboard");
+        XFlush(display);
+        sleep(1);
+        XCloseDisplay(display);
+    }
+    syslog(LOG_NOTICE,"xtrlock ended");
 }
 
-static inline void clear_buffer(char *buffer, size_t size) {
-	volatile char *p = buffer;
-	memset(p,-1,size);
+static inline void clear_buffer(char *buffer, size_t size)
+{
+	const char * const limit = buffer + size;
+    for (volatile register char *p = buffer;p < limit;++p) {
+    	*p = 0xFD;
+    }
 }
 
 #if MULTITOUCH
@@ -264,29 +275,30 @@ void handle_multitouch(Cursor cursor)
 		syslog(LOG_DEBUG,"New cursor " #b ); \
 		break;
 
-void set_cursor(Display *display, unsigned int event_mask,State programState) {
-	XColor csr_fg, csr_bg;
-	static Cursor cursor;
-	Pixmap csr_source;
-	Pixmap csr_mask;
+void set_cursor(Display *display, unsigned int event_mask,State programState)
+{
+    XColor csr_fg, csr_bg;
+    static Cursor cursor;
+    Pixmap csr_source;
+    Pixmap csr_mask;
 
-	syslog(LOG_NOTICE,"State = %s",stateToString(programState));
+    syslog(LOG_NOTICE,"State = %s",stateToString(programState));
 
-	switch(programState) {
-	STATE_TABLE
-	}
+    switch(programState) {
+        STATE_TABLE
+    }
 
-	int error = XChangeActivePointerGrab(display,event_mask,cursor,CurrentTime);
-	if (error != Success) {
-		syslog(LOG_ERR,"XChangeActivePointerGrab error %d",error);
-	}
-	XSync(display,False);
+    int error = XChangeActivePointerGrab(display,event_mask,cursor,CurrentTime);
+    if (error != Success) {
+        syslog(LOG_ERR,"XChangeActivePointerGrab error %d",error);
+    }
+    XSync(display,False);
 }
 #undef X
 
 static inline void printVersion(void)
 {
-  printf("xtrlock %s" EOL ,program_version);
+    printf("xtrlock %s" EOL,program_version);
 }
 
 static const struct option longopts[] = {
@@ -294,12 +306,12 @@ static const struct option longopts[] = {
 #define NO_ARG          no_argument
 #define OPT_ARG         optional_argument
 #define X(l,s,t,o)      { TO_STRING(l),o,NULL,TO_STRING(s)[0] },
-  CMDLINE_OPTS_TABLE
+    CMDLINE_OPTS_TABLE
 #undef X
 #undef NEED_ARG
 #undef NO_ARG
 #undef OPT_ARG
-  { NULL, 0, NULL, 0 }
+    { NULL, 0, NULL, 0 }
 };
 
 static inline void printHelp(const char *errorMsg)
@@ -308,11 +320,11 @@ static inline void printHelp(const char *errorMsg)
 
 #define USAGE "Usage: " TO_STRING(PROGNAME) " [OPTIONS]" EOL
 
-  if (errorMsg != NULL) {
-    fprintf(stderr, "Error %s" EOL USAGE CMDLINE_OPTS_TABLE, errorMsg);
-  } else {
-    fprintf(stdout, USAGE CMDLINE_OPTS_TABLE);
-  }
+    if (errorMsg != NULL) {
+        fprintf(stderr, "Error %s" EOL USAGE CMDLINE_OPTS_TABLE, errorMsg);
+    } else {
+        fprintf(stdout, USAGE CMDLINE_OPTS_TABLE);
+    }
 #undef X
 #undef USAGE
 }
@@ -324,45 +336,45 @@ static int parse_cmdLine(int argc,char *const argv[])
 #define OPT_ARG         "::"
 #define X(l,s,t,o) TO_STRING(s) o
 
-  int error = EXIT_SUCCESS;
-  int optc;
+    int error = EXIT_SUCCESS;
+    int optc;
 
-  parameters.modes = 0x0;
-  while (((optc = getopt_long(argc, argv, CMDLINE_OPTS_TABLE, longopts, NULL)) != -1)
-         && (EXIT_SUCCESS == error)) {
-    switch (optc) {
-    case 'c':
-      parameters.modes |= e_Blank;
-      break;
-    case 'f':
-      parameters.modes |= e_ForkAfter;
-      break;
-    case 'u':
-      parameters.modes |= e_MultiUsers;
-      break;
-    case 'h':
-      printHelp(NULL);
-      exit(EXIT_SUCCESS);
-      break;
-    case 'v':
-      printVersion();
-      exit(EXIT_SUCCESS);
-      break;
-    case '?':
-      error = EINVAL;
-      printHelp("");
-      break;
-    default:
-      error = EINVAL;
-      printHelp("invalid parameter");
-      break;
-    } /* switch */
-  } /*while(((optc = getopt_long(argc,argv,"cln:phv",longopts,NULL))!= -1) && (EXIT_SUCCESS == error))*/
+    parameters.modes = 0x0;
+    while (((optc = getopt_long(argc, argv, CMDLINE_OPTS_TABLE, longopts, NULL)) != -1)
+            && (EXIT_SUCCESS == error)) {
+        switch (optc) {
+        case 'b':
+            parameters.modes |= e_Blank;
+            break;
+        case 'f':
+            parameters.modes |= e_ForkAfter;
+            break;
+        case 'u':
+            parameters.modes |= e_MultiUsers;
+            break;
+        case 'h':
+            printHelp(NULL);
+            exit(EXIT_SUCCESS);
+            break;
+        case 'v':
+            printVersion();
+            exit(EXIT_SUCCESS);
+            break;
+        case '?':
+            error = EINVAL;
+            printHelp("");
+            break;
+        default:
+            error = EINVAL;
+            printHelp("invalid parameter");
+            break;
+        } /* switch */
+    } /*while(((optc = getopt_long(argc,argv,"cln:phv",longopts,NULL))!= -1) && (EXIT_SUCCESS == error))*/
 #undef X
 #undef NEED_ARG
 #undef NO_ARG
 #undef OPT_ARG
-  return error;
+    return error;
 }
 
 int main(int argc, char **argv)
@@ -393,7 +405,7 @@ int main(int argc, char **argv)
 
     error = parse_cmdLine(argc,argv);
     if (error != EXIT_SUCCESS) {
-    	goto loop_x;
+        goto loop_x;
     }
 
     openlog("xtrlock",LOG_CONS|LOG_PID,LOG_AUTH);
@@ -498,17 +510,17 @@ int main(int argc, char **argv)
         }
         switch(ret) {
         case AlreadyGrabbed:
-        	fprintf(stderr,"AlreadyGrabbed, retrying...\n");
-        	break;
+            fprintf(stderr,"AlreadyGrabbed, retrying...\n");
+            break;
         case GrabFrozen:
-        	fprintf(stderr,"GrabFrozen, retrying...\n");
-        	break;
+            fprintf(stderr,"GrabFrozen, retrying...\n");
+            break;
         case GrabInvalidTime:
-        	fprintf(stderr,"GrabInvalidTime, retrying...\n");
-        	break;
+            fprintf(stderr,"GrabInvalidTime, retrying...\n");
+            break;
         default:
-        	fprintf(stderr,"XGrabKeyboard retcode = %d, retrying...\n",ret);
-        	break;
+            fprintf(stderr,"XGrabKeyboard retcode = %d, retrying...\n",ret);
+            break;
         }
         /*grab failed; wait .01s*/
         tv.tv_sec=0;
@@ -547,8 +559,8 @@ int main(int argc, char **argv)
 
     log_session_lock();
     for (;;) {
-    	XEvent ev;
-    	syslog(LOG_ERR,"waiting events.... ");
+        XEvent ev;
+        syslog(LOG_ERR,"waiting events.... ");
         XNextEvent(display,&ev);
         syslog(LOG_ERR,"ev.type = %d",ev.type);
         switch (ev.type) {
@@ -561,58 +573,66 @@ int main(int argc, char **argv)
             switch (ks) {
             case XK_Escape:
             case XK_Clear:
-            	resetState();
+                resetState();
                 syslog(LOG_DEBUG,"clear");
                 break;
             case XK_Delete:
             case XK_BackSpace: //parameters.modes == e_MultiUsers
                 if (rlen>0) rlen--;
                 if (0 == rlen) {
-                	if (LoginName == programState) {
-                		resetState();
-                	}
-                	syslog(LOG_DEBUG,"cleared");
+                    if (LoginName == programState) {
+                        resetState();
+                    }
+                    syslog(LOG_DEBUG,"cleared");
                 }
                 break;
             case XK_Linefeed:
             case XK_Return:
-            	if (rlen) {
-            		rbuf[rlen] = '\0';
-            		if (LoginName == programState) {
-            			user.login = rbuf;
-            			rbuf = password;
-            			rlen = 0;
-            			programState = nextState(programState);
-            			set_cursor(display, (event_mask)&0,programState);
-            		} else if (Password == programState) {
-            			int error = EXIT_SUCCESS;
-            			user.password = rbuf;
-            			error = authenticate(&user);
-            			clear_buffer(password,sizeof(password));
-            			log_session_access(user.login, EXIT_SUCCESS == error);
-            			if (EXIT_SUCCESS == error) {
-            				goto loop_x;
-            			}
-            			XBell(display,0);
-						rlen= 0;
-						if (timeout) {
-							goodwill+= ev.xkey.time - timeout;
-							if (goodwill > MAXGOODWILL) {
-								goodwill= MAXGOODWILL;
-							}
-						}
-						timeout= -goodwill*GOODWILLPORTION;
-						goodwill+= timeout;
-						timeout+= ev.xkey.time + TIMEOUTPERATTEMPT;
-						resetState();
-            		}
-            	}
+                if (rlen) {
+                    rbuf[rlen] = '\0';
+                    if (LoginName == programState) {
+                        user.login = rbuf;
+                        rbuf = password;
+                        rlen = 0;
+                        programState = nextState(programState);
+                        set_cursor(display, (event_mask)&0,programState);
+                    } else if (Password == programState) {
+                        int error = EXIT_SUCCESS;
+                        user.password = rbuf;
+                        error = authenticate(&user);
+                        clear_buffer(password,sizeof(password));
+                        log_session_access(user.login, EXIT_SUCCESS == error);
+                        if (EXIT_SUCCESS == error) {
+                            goto loop_x;
+                        }
+                        XBell(display,0);
+                        rlen= 0;
+                        if (timeout) {
+                            goodwill+= ev.xkey.time - timeout;
+                            if (goodwill > MAXGOODWILL) {
+                                goodwill= MAXGOODWILL;
+                            }
+                        }
+                        timeout= -goodwill*GOODWILLPORTION;
+                        goodwill+= timeout;
+                        timeout+= ev.xkey.time + TIMEOUTPERATTEMPT;
+                        resetState();
+                    }
+                }
                 break;
             default:
                 if (clen != 1) break;
                 if (Idle == programState) {
-                	programState = nextState(programState);
-                	set_cursor(display, (event_mask)&0,programState);
+                    programState = nextState(programState);
+                    if ((parameters.modes & e_MultiUsers) != e_MultiUsers) {
+                        /* single user mode: auto fill the login name */
+                        user.login = get_username(loginName, sizeof(loginName));
+                        rbuf = password;
+                        rlen = 0;
+                        programState = nextState(programState);
+                    }
+
+                    set_cursor(display, (event_mask)&0,programState);
                 }
                 /* allow space for the trailing \0 */
                 if (rlen < (sizeof(rbuf) - 1)) {

@@ -14,8 +14,8 @@
 #define AUTH_H_
 
 typedef struct UserAuthenticationData_ {
-	char *login;
-	char *password;
+    char *login;
+    char *password;
 } UserAuthenticationData;
 
 int auth_shadow(const UserAuthenticationData *userData);

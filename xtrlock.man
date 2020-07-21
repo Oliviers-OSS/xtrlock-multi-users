@@ -34,19 +34,26 @@ blank the screen as well as displaying the padlock
 \fB\-f\fR
 fork after locking is complete, and return success from the parent
 process
+.TP
+\fB\-u\fR
+multi-users mode to allow any user, after successful authentication,
+to log on another user'session (usefull for test or supervisor bench
+running on a dedicated account for example).
 .SH X RESOURCES, CONFIGURATION
 None.
 .SH BUGS
 Additional input devices other than the keyboard and mouse are not
 disabled.
+Doesn't work on GNOME desktop.
 
 The timeouts, bitmaps and mouse cursor colour cannot be modifed.
 .SH SEE ALSO
 .BR X "(1), Xlib Documentation."
-.SH AUTHOR
+.SH AUTHORS
 Ian Jackson <ian@chiark.greenend.org.uk>
 .SH COPYRIGHT
 Copyright (C) 1993, 1994 by Ian Jackson.
+Copyright (C) 2000 by Olivier Charloton (multi-users mode)
 
 Permission to use, copy, modify and distribute this software and its
 documentation is granted under the terms of the GNU General Public
