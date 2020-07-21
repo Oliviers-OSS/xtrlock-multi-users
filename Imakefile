@@ -12,6 +12,6 @@
 #! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #! GNU General Public License for more details.
 
-SingleProgramTarget(xtrlock,xtrlock.o,-lcrypt -lX11 -lXi,)
+SingleProgramTarget(xtrlock,xtrlock.o auth.o,-lcrypt -lX11 -lXi -lpam,)
 InstallProgram(xtrlock,$(BINDIR))
 InstallManPage(xtrlock,$(MANDIR))

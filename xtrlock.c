@@ -4,6 +4,7 @@
  * X Transparent Lock
  *
  * Copyright (C)1993,1994 Ian Jackson
+ * 2020 Olivier Charloton Multi-user mode
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +22,7 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/Xos.h>
+#include <linux/limits.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -36,6 +38,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <values.h>
+#include <syslog.h>
 
 #ifdef SHADOW_PWD
 #include <shadow.h>
@@ -46,34 +49,184 @@
 #include <X11/extensions/XInput2.h>
 #endif
 
+#include "auth.h"
+#include "cmdline_parameters.h"
+#include "patchlevel.h"
 #include "lock.bitmap"
 #include "mask.bitmap"
-#include "patchlevel.h"
+#include "password_icon.xbm"
+#include "password_mask.xbm"
+#include "user_icon.xbm"
+#include "user_mask.xbm"
 
-Display *display;
+#ifndef TO_STRING
+#define STRING(x) #x
+#define TO_STRING(x) STRING(x)
+#endif /* STRING */
+
+#define STATE(s,b)  X(s,b)
+#define STATE_TABLE \
+		STATE(Idle,lock) \
+		STATE(LoginName,user) \
+		STATE(Password,password)
+
+#define X(s,b)    s,
+typedef enum State_ {
+    STATE_TABLE
+} State;
+#undef X
+
+Display *display = NULL;
 Window window, root;
+cmndline_parameters parameters = {
+		.modes = 0x0
+};
+
+State nextState(const State state) {
+	State next = Idle;
+	switch(state) {
+	case Idle:
+		next = LoginName;
+		break;
+	case LoginName:
+		next = Password;
+		break;
+	case Password:
+		next = Idle;
+		break;
+	}
+	return next;
+}
+
+#define resetState() \
+	programState = Idle; \
+	rbuf = loginName; \
+	rlen = 0; \
+    set_cursor(display, (event_mask)&0,programState);
+
+
+static inline const char * stateToString(const State state) {
+#define X(s,b) case s: return TO_STRING(s);
+	switch(state) {
+	STATE_TABLE
+	}
+#undef X
+	return "";
+}
 
 #define TIMEOUTPERATTEMPT 30000
 #define MAXGOODWILL  (TIMEOUTPERATTEMPT*5)
 #define INITIALGOODWILL MAXGOODWILL
 #define GOODWILLPORTION 0.3
 
-struct passwd *pw;
-int passwordok(const char *s) {
-#if 0
-  char key[3];
-  char *encr;
-  
-  key[0] = *(pw->pw_passwd);
-  key[1] =  (pw->pw_passwd)[1];
-  key[2] =  0;
-  encr = crypt(s, key);
-  return !strcmp(encr, pw->pw_passwd);
-#else
-  /* simpler, and should work with crypt() algorithms using longer
-     salt strings (like the md5-based one on freebsd).  --marekm */
-  return !strcmp(crypt(s, pw->pw_passwd), pw->pw_passwd);
-#endif
+static char *get_username(void)
+{
+  uid_t uid = getuid();
+  char *username = NULL;
+
+  /* Get the user name from the environment if started as root. */
+  if (uid == 0)
+    username = getenv("USER");
+
+  if (username == NULL) {
+    struct passwd *pw;
+
+    /* Get the password entry. */
+    pw = getpwuid(uid);
+
+    if (pw == NULL)
+      return NULL;
+
+    username = pw->pw_name;
+  }
+
+  return strdup(username);
+}
+
+int log_session_access(const char *newuser,Bool success)
+{
+  int error = EXIT_SUCCESS;
+  uid_t uid = getuid();
+  char *username = NULL;
+  char buffer[100];
+
+  /* Get the user name from the environment if started as root. */
+  if (uid == 0)
+    username = getenv("USER");
+
+  if (username == NULL) {
+    struct passwd *pw;
+
+    /* Get the password entry. */
+    pw = getpwuid(uid);
+
+    if (pw != NULL) {
+      username = pw->pw_name;
+    } else {
+      error = ENOENT;
+      sprintf(buffer,"(%u)",uid);
+      username = buffer;
+    }
+  }
+
+  if (!newuser) {
+	newuser = "???";
+  }
+
+  if (success) {
+    syslog(LOG_NOTICE,"user %s entering into %s's session",newuser,username);
+  } else {
+    syslog(LOG_ERR,"user %s authentication has failed to enter into %s's session",newuser,username);
+  }
+
+  return error;
+}
+
+static inline void log_session_lock()
+{
+  uid_t uid = getuid();
+  char *username = NULL;
+  char buffer[16];
+
+  /* Get the user name from the environment if started as root. */
+  if (uid == 0)
+    username = getenv("USER");
+
+  if (username == NULL) {
+    struct passwd *pw;
+
+    /* Get the password entry. */
+    pw = getpwuid(uid);
+
+    if (pw != NULL) {
+      username = pw->pw_name;
+    } else {
+      sprintf(buffer,"(%u)",uid);
+      username = buffer;
+    }
+  }
+
+  const char *mode = "mono-user";
+  if ((parameters.modes & e_MultiUsers) == e_MultiUsers) {
+    mode = "multi-users";
+  }
+  syslog(LOG_NOTICE,"User %s's session is now locked (%s)",username,mode);
+}
+
+static void onExit(void) {
+	if (display) {
+		XUngrabKeyboard(display,CurrentTime);
+		syslog(LOG_DEBUG,"exit XUngrabKeyboard");
+		XFlush(display);
+		sleep(1);
+		XCloseDisplay(display);
+	}
+	syslog(LOG_NOTICE,"xtrlock ended");
+}
+
+static inline void clear_buffer(char *buffer, size_t size) {
+	volatile char *p = buffer;
+	memset(p,-1,size);
 }
 
 #if MULTITOUCH
@@ -81,265 +234,408 @@ XIEventMask evmask;
 
 /* (Optimistically) attempt to grab multitouch devices which are not
  * intercepted via XGrabPointer. */
-void handle_multitouch(Cursor cursor) {
-  XIDeviceInfo *info;
-  int xi_ndevices;
+void handle_multitouch(Cursor cursor)
+{
+    XIDeviceInfo *info;
+    int xi_ndevices;
 
-  info = XIQueryDevice(display, XIAllDevices, &xi_ndevices);
+    info = XIQueryDevice(display, XIAllDevices, &xi_ndevices);
 
-  int i;
-  for (i = 0; i < xi_ndevices; i++) {
-    XIDeviceInfo *dev = &info[i];
+    int i;
+    for (i = 0; i < xi_ndevices; i++) {
+        XIDeviceInfo *dev = &info[i];
 
-    int j;
-    for (j = 0; j < dev->num_classes; j++) {
-      if (dev->classes[j]->type == XITouchClass &&
-          dev->use == XISlavePointer) {
-        XIGrabDevice(display, dev->deviceid, window, CurrentTime, cursor,
-                     GrabModeAsync, GrabModeAsync, False, &evmask);
-      }
+        int j;
+        for (j = 0; j < dev->num_classes; j++) {
+            if (dev->classes[j]->type == XITouchClass &&
+                    dev->use == XISlavePointer) {
+                XIGrabDevice(display, dev->deviceid, window, CurrentTime, cursor,
+                             GrabModeAsync, GrabModeAsync, False, &evmask);
+            }
+        }
     }
-  }
-  XIFreeDeviceInfo(info);
+    XIFreeDeviceInfo(info);
 }
 #endif
 
-int main(int argc, char **argv){
-  XEvent ev;
-  KeySym ks;
-  char cbuf[10], rbuf[128]; /* shadow appears to suggest 127 a good value here */
-  int clen, rlen=0;
-  long goodwill= INITIALGOODWILL, timeout= 0;
-  XSetWindowAttributes attrib;
-  Cursor cursor;
-  Pixmap csr_source,csr_mask;
-  XColor csr_fg, csr_bg, dummy, black;
-  int ret, screen, blank = 0, fork_after = 0;
-#ifdef SHADOW_PWD
-  struct spwd *sp;
-#endif
-  struct timeval tv;
-  int tvt, gs;
+#define X(s,b) case s: csr_source = XCreateBitmapFromData(display,window,b##_bits,b##_width,b##_height); \
+		csr_mask = XCreateBitmapFromData(display,window,b##_mask_bits,b##_mask_width,b##_mask_height); \
+		cursor = XCreatePixmapCursor(display,csr_source,csr_mask,&csr_fg,&csr_bg,b##_x_hot,b##_y_hot); \
+		syslog(LOG_DEBUG,"New cursor " #b ); \
+		break;
 
-  while (argc > 1) {
-    if ((strcmp(argv[1], "-b") == 0)) {
-      blank = 1;
-      argc--;
-      argv++;
-    } else if ((strcmp(argv[1], "-f") == 0)) {
-      fork_after = 1;
-      argc--;
-      argv++;
-    } else {
-      fprintf(stderr,"xtrlock (version %s); usage: xtrlock [-b] [-f]\n",
-              program_version);
-      exit(1);
-    }
-  }
-  
-  errno=0;  pw= getpwuid(getuid());
-  if (!pw) { perror("password entry for uid not found"); exit(1); }
-#ifdef SHADOW_PWD
-  sp = getspnam(pw->pw_name);
-  if (sp)
-    pw->pw_passwd = sp->sp_pwdp;
-  endspent();
-#endif
+void set_cursor(Display *display, unsigned int event_mask,State programState) {
+	XColor csr_fg, csr_bg;
+	static Cursor cursor;
+	Pixmap csr_source;
+	Pixmap csr_mask;
 
-  /* logically, if we need to do the following then the same 
-     applies to being installed setgid shadow.  
-     we do this first, because of a bug in linux. --jdamery */ 
-  if (setgid(getgid())) { perror("setgid"); exit(1); }
-  /* we can be installed setuid root to support shadow passwords,
-     and we don't need root privileges any longer.  --marekm */
-  if (setuid(getuid())) { perror("setuid"); exit(1); }
+	syslog(LOG_NOTICE,"State = %s",stateToString(programState));
 
-  if (strlen(pw->pw_passwd) < 13) {
-    fputs("password entry has no pwd\n",stderr); exit(1);
-  }
-  
-  display= XOpenDisplay(0);
-
-  if (display==NULL) {
-    fprintf(stderr,"xtrlock (version %s): cannot open display\n",
-	    program_version);
-    exit(1);
-  }
-
-#ifdef MULTITOUCH
-  unsigned char mask[XIMaskLen(XI_LASTEVENT)];
-  int xi_major = 2, xi_minor = 2, xi_opcode, xi_error, xi_event;
-
-  if (!XQueryExtension(display, INAME, &xi_opcode, &xi_event, &xi_error)) {
-    fprintf(stderr, "xtrlock (version %s): No X Input extension\n",
-            program_version);
-    exit(1);
-  }
-  
-  if (XIQueryVersion(display, &xi_major, &xi_minor) != Success ||
-      xi_major * 10 + xi_minor < 22) {
-    fprintf(stderr,"xtrlock (version %s): Need XI 2.2\n",
-            program_version);
-    exit(1);
-  }
-
-  evmask.mask = mask;
-  evmask.mask_len = sizeof(mask);
-  memset(mask, 0, sizeof(mask));
-  evmask.deviceid = XIAllDevices;
-  XISetMask(mask, XI_HierarchyChanged);
-  XISelectEvents(display, DefaultRootWindow(display), &evmask, 1);
-#endif
-
-  attrib.override_redirect= True;
-
-  if (blank) {
-    screen = DefaultScreen(display);
-    attrib.background_pixel = BlackPixel(display, screen);
-    window= XCreateWindow(display,DefaultRootWindow(display),
-                          0,0,DisplayWidth(display, screen),DisplayHeight(display, screen),
-                          0,DefaultDepth(display, screen), CopyFromParent, DefaultVisual(display, screen),
-                          CWOverrideRedirect|CWBackPixel,&attrib); 
-    XAllocNamedColor(display, DefaultColormap(display, screen), "black", &black, &dummy);
-  } else {
-    window= XCreateWindow(display,DefaultRootWindow(display),
-                          0,0,1,1,0,CopyFromParent,InputOnly,CopyFromParent,
-                          CWOverrideRedirect,&attrib);
-  }
-                        
-  XSelectInput(display,window,KeyPressMask|KeyReleaseMask);
-
-  csr_source= XCreateBitmapFromData(display,window,lock_bits,lock_width,lock_height);
-  csr_mask= XCreateBitmapFromData(display,window,mask_bits,mask_width,mask_height);
-
-  ret = XAllocNamedColor(display,
-                        DefaultColormap(display, DefaultScreen(display)),
-                        "steelblue3",
-                        &dummy, &csr_bg);
-  if (ret==0)
-    XAllocNamedColor(display,
-                    DefaultColormap(display, DefaultScreen(display)),
-                    "black",
-                    &dummy, &csr_bg);
-
-  ret = XAllocNamedColor(display,
-                        DefaultColormap(display,DefaultScreen(display)),
-                        "grey25",
-                        &dummy, &csr_fg);
-  if (ret==0)
-    XAllocNamedColor(display,
-                    DefaultColormap(display, DefaultScreen(display)),
-                    "white",
-                    &dummy, &csr_bg);
-
-
-
-  cursor= XCreatePixmapCursor(display,csr_source,csr_mask,&csr_fg,&csr_bg,
-                              lock_x_hot,lock_y_hot);
-
-  XMapWindow(display,window);
-
-  /*Sometimes the WM doesn't ungrab the keyboard quickly enough if
-   *launching xtrlock from a keystroke shortcut, meaning xtrlock fails
-   *to start We deal with this by waiting (up to 100 times) for 10,000
-   *microsecs and trying to grab each time. If we still fail
-   *(i.e. after 1s in total), then give up, and emit an error
-   */
-  
-  gs=0; /*gs==grab successful*/
-  for (tvt=0 ; tvt<100; tvt++) {
-    ret = XGrabKeyboard(display,window,False,GrabModeAsync,GrabModeAsync,
-			CurrentTime);
-    if (ret == GrabSuccess) {
-      gs=1;
-      break;
-    }
-    /*grab failed; wait .01s*/
-    tv.tv_sec=0;
-    tv.tv_usec=10000;
-    select(1,NULL,NULL,NULL,&tv);
-  }
-  if (gs==0){
-    fprintf(stderr,"xtrlock (version %s): cannot grab keyboard\n",
-	    program_version);
-    exit(1);
-  }
-
-  if (XGrabPointer(display,window,False,(KeyPressMask|KeyReleaseMask)&0,
-               GrabModeAsync,GrabModeAsync,None,
-               cursor,CurrentTime)!=GrabSuccess) {
-    XUngrabKeyboard(display,CurrentTime);
-    fprintf(stderr,"xtrlock (version %s): cannot grab pointer\n",
-	    program_version);
-    exit(1);
-  }
-
-  if (fork_after) {
-    pid_t pid = fork();
-    if (pid < 0) {
-      fprintf(stderr,"xtrlock (version %s): cannot fork: %s\n",
-              program_version, strerror(errno));
-      exit(1);
-    } else if (pid > 0) {
-      exit(0);
-    }
-  }
-
-#ifdef MULTITOUCH
-  handle_multitouch(cursor);
-#endif
-
-  for (;;) {
-    XNextEvent(display,&ev);
-    switch (ev.type) {
-    case KeyPress:
-      if (ev.xkey.time < timeout) { XBell(display,0); break; }
-      clen= XLookupString(&ev.xkey,cbuf,9,&ks,0);
-      switch (ks) {
-      case XK_Escape: case XK_Clear:
-        rlen=0; break;
-      case XK_Delete: case XK_BackSpace:
-        if (rlen>0) rlen--;
-        break;
-      case XK_Linefeed: case XK_Return:
-        if (rlen==0) break;
-        rbuf[rlen]=0;
-        if (passwordok(rbuf)) goto loop_x;
-        XBell(display,0);
-        rlen= 0;
-        if (timeout) {
-          goodwill+= ev.xkey.time - timeout;
-          if (goodwill > MAXGOODWILL) {
-            goodwill= MAXGOODWILL;
-          }
-        }
-        timeout= -goodwill*GOODWILLPORTION;
-        goodwill+= timeout;
-        timeout+= ev.xkey.time + TIMEOUTPERATTEMPT;
-        break;
-      default:
-        if (clen != 1) break;
-        /* allow space for the trailing \0 */
-	if (rlen < (sizeof(rbuf) - 1)){
-	  rbuf[rlen]=cbuf[0];
-	  rlen++;
+	switch(programState) {
+	STATE_TABLE
 	}
-        break;
-      }
-      break;
-#if MULTITOUCH
-    case GenericEvent:
-      if (ev.xcookie.extension == xi_opcode &&
-          XGetEventData(display,&ev.xcookie) &&
-          ev.xcookie.evtype == XI_HierarchyChanged) {
-        handle_multitouch(cursor);
-      }
-      break;
-#endif
-    default:
-      break;
-    }
+
+	int error = XChangeActivePointerGrab(display,event_mask,cursor,CurrentTime);
+	if (error != Success) {
+		syslog(LOG_ERR,"XChangeActivePointerGrab error %d",error);
+	}
+	XSync(display,False);
+}
+#undef X
+
+static inline void printVersion(void)
+{
+  printf("xtrlock %s" EOL ,program_version);
+}
+
+static const struct option longopts[] = {
+#define NEED_ARG        required_argument
+#define NO_ARG          no_argument
+#define OPT_ARG         optional_argument
+#define X(l,s,t,o)      { TO_STRING(l),o,NULL,TO_STRING(s)[0] },
+  CMDLINE_OPTS_TABLE
+#undef X
+#undef NEED_ARG
+#undef NO_ARG
+#undef OPT_ARG
+  { NULL, 0, NULL, 0 }
+};
+
+static inline void printHelp(const char *errorMsg)
+{
+#define X(l,s,t,o) "-" TO_STRING(s) ", --" TO_STRING(l) t EOL
+
+#define USAGE "Usage: " TO_STRING(PROGNAME) " [OPTIONS]" EOL
+
+  if (errorMsg != NULL) {
+    fprintf(stderr, "Error %s" EOL USAGE CMDLINE_OPTS_TABLE, errorMsg);
+  } else {
+    fprintf(stdout, USAGE CMDLINE_OPTS_TABLE);
   }
- loop_x:
-  exit(0);
+#undef X
+#undef USAGE
+}
+
+static int parse_cmdLine(int argc,char *const argv[])
+{
+#define NEED_ARG        ":"
+#define NO_ARG          ""
+#define OPT_ARG         "::"
+#define X(l,s,t,o) TO_STRING(s) o
+
+  int error = EXIT_SUCCESS;
+  int optc;
+
+  parameters.modes = 0x0;
+  while (((optc = getopt_long(argc, argv, CMDLINE_OPTS_TABLE, longopts, NULL)) != -1)
+         && (EXIT_SUCCESS == error)) {
+    switch (optc) {
+    case 'c':
+      parameters.modes |= e_Blank;
+      break;
+    case 'f':
+      parameters.modes |= e_ForkAfter;
+      break;
+    case 'u':
+      parameters.modes |= e_MultiUsers;
+      break;
+    case 'h':
+      printHelp(NULL);
+      exit(EXIT_SUCCESS);
+      break;
+    case 'v':
+      printVersion();
+      exit(EXIT_SUCCESS);
+      break;
+    case '?':
+      error = EINVAL;
+      printHelp("");
+      break;
+    default:
+      error = EINVAL;
+      printHelp("invalid parameter");
+      break;
+    } /* switch */
+  } /*while(((optc = getopt_long(argc,argv,"cln:phv",longopts,NULL))!= -1) && (EXIT_SUCCESS == error))*/
+#undef X
+#undef NEED_ARG
+#undef NO_ARG
+#undef OPT_ARG
+  return error;
+}
+
+int main(int argc, char **argv)
+{
+    int error = EXIT_SUCCESS;
+    State programState = Idle;
+    KeySym ks;
+    char cbuf[10];
+    int clen, rlen=0;
+    long goodwill= INITIALGOODWILL, timeout= 0;
+    XSetWindowAttributes attrib;
+    Cursor cursor;
+    Pixmap csr_source,csr_mask;
+    XColor csr_fg, csr_bg, dummy, black;
+    int ret, screen;
+    UserAuthenticationData user = {NULL,NULL};
+    char loginName[LOGIN_NAME_MAX];
+    char password[256];
+    char *rbuf = loginName;
+    char *display_name = getenv("DISPLAY");
+
+#ifdef SHADOW_PWD
+    struct spwd *sp;
+#endif
+    struct timeval tv;
+    int tvt, gs;
+    unsigned int event_mask = KeyPressMask|KeyReleaseMask;
+
+    error = parse_cmdLine(argc,argv);
+    if (error != EXIT_SUCCESS) {
+    	goto loop_x;
+    }
+
+    openlog("xtrlock",LOG_CONS|LOG_PID,LOG_AUTH);
+
+    display= XOpenDisplay(0);
+    if (display==NULL) {
+        fprintf(stderr,"xtrlock (version %s): cannot open display\n",
+                program_version);
+        exit(1);
+    }
+
+    atexit(onExit);
+
+#ifdef MULTITOUCH
+    unsigned char mask[XIMaskLen(XI_LASTEVENT)];
+    int xi_major = 2, xi_minor = 2, xi_opcode, xi_error, xi_event;
+
+    if (!XQueryExtension(display, INAME, &xi_opcode, &xi_event, &xi_error)) {
+        fprintf(stderr, "xtrlock (version %s): No X Input extension\n",
+                program_version);
+        exit(1);
+    }
+
+    if (XIQueryVersion(display, &xi_major, &xi_minor) != Success ||
+            xi_major * 10 + xi_minor < 22) {
+        fprintf(stderr,"xtrlock (version %s): Need XI 2.2\n",
+                program_version);
+        exit(1);
+    }
+
+    evmask.mask = mask;
+    evmask.mask_len = sizeof(mask);
+    memset(mask, 0, sizeof(mask));
+    evmask.deviceid = XIAllDevices;
+    XISetMask(mask, XI_HierarchyChanged);
+    XISelectEvents(display, DefaultRootWindow(display), &evmask, 1);
+#endif
+
+    attrib.override_redirect= True;
+
+    if ((parameters.modes & e_Blank) == e_Blank) {
+        screen = DefaultScreen(display);
+        attrib.background_pixel = BlackPixel(display, screen);
+        window= XCreateWindow(display,DefaultRootWindow(display),
+                              0,0,DisplayWidth(display, screen),DisplayHeight(display, screen),
+                              0,DefaultDepth(display, screen), CopyFromParent, DefaultVisual(display, screen),
+                              CWOverrideRedirect|CWBackPixel,&attrib);
+        XAllocNamedColor(display, DefaultColormap(display, screen), "black", &black, &dummy);
+    } else {
+        window= XCreateWindow(display,DefaultRootWindow(display),
+                              0,0,1,1,0,CopyFromParent,InputOnly,CopyFromParent,
+                              CWOverrideRedirect,&attrib);
+    }
+
+    XSelectInput(display,window,event_mask);
+
+    csr_source= XCreateBitmapFromData(display,window,lock_bits,lock_width,lock_height);
+    csr_mask= XCreateBitmapFromData(display,window,lock_mask_bits,lock_mask_width,lock_mask_height);
+
+    ret = XAllocNamedColor(display,
+                           DefaultColormap(display, DefaultScreen(display)),
+                           "steelblue3",
+                           &dummy, &csr_bg);
+    if (ret==0)
+        XAllocNamedColor(display,
+                         DefaultColormap(display, DefaultScreen(display)),
+                         "black",
+                         &dummy, &csr_bg);
+
+    ret = XAllocNamedColor(display,
+                           DefaultColormap(display,DefaultScreen(display)),
+                           "grey25",
+                           &dummy, &csr_fg);
+    if (ret==0)
+        XAllocNamedColor(display,
+                         DefaultColormap(display, DefaultScreen(display)),
+                         "white",
+                         &dummy, &csr_bg);
+
+
+
+    cursor= XCreatePixmapCursor(display,csr_source,csr_mask,&csr_fg,&csr_bg,
+                                lock_x_hot,lock_y_hot);
+
+    XMapWindow(display,window);
+    syslog(LOG_NOTICE,"Window = %lu",window);
+
+    /*Sometimes the WM doesn't ungrab the keyboard quickly enough if
+     *launching xtrlock from a keystroke shortcut, meaning xtrlock fails
+     *to start We deal with this by waiting (up to 100 times) for 10,000
+     *microsecs and trying to grab each time. If we still fail
+     *(i.e. after 1s in total), then give up, and emit an error
+     */
+
+    gs=0; /*gs==grab successful*/
+    for (tvt=0 ; tvt<100; tvt++) {
+        ret = XGrabKeyboard(display,window,False,GrabModeAsync,GrabModeAsync,
+                            CurrentTime);
+        if (ret == GrabSuccess) {
+            gs=1;
+            break;
+        }
+        switch(ret) {
+        case AlreadyGrabbed:
+        	fprintf(stderr,"AlreadyGrabbed, retrying...\n");
+        	break;
+        case GrabFrozen:
+        	fprintf(stderr,"GrabFrozen, retrying...\n");
+        	break;
+        case GrabInvalidTime:
+        	fprintf(stderr,"GrabInvalidTime, retrying...\n");
+        	break;
+        default:
+        	fprintf(stderr,"XGrabKeyboard retcode = %d, retrying...\n",ret);
+        	break;
+        }
+        /*grab failed; wait .01s*/
+        tv.tv_sec=0;
+        tv.tv_usec=10000;
+        select(1,NULL,NULL,NULL,&tv);
+    }
+    if (gs==0) {
+        fprintf(stderr,"xtrlock (version %s): cannot grab keyboard\n",
+                program_version);
+        exit(1);
+    }
+
+    if (XGrabPointer(display,window,False,(event_mask)&0,
+                     GrabModeAsync,GrabModeAsync,None,
+                     cursor,CurrentTime)!=GrabSuccess) {
+        XUngrabKeyboard(display,CurrentTime);
+        fprintf(stderr,"xtrlock (version %s): cannot grab pointer\n",
+                program_version);
+        exit(1);
+    }
+
+    if ((parameters.modes & e_ForkAfter) == e_ForkAfter) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            fprintf(stderr,"xtrlock (version %s): cannot fork: %s\n",
+                    program_version, strerror(errno));
+            exit(1);
+        } else if (pid > 0) {
+            exit(0);
+        }
+    }
+
+#ifdef MULTITOUCH
+    handle_multitouch(cursor);
+#endif
+
+    log_session_lock();
+    for (;;) {
+    	XEvent ev;
+    	syslog(LOG_ERR,"waiting events.... ");
+        XNextEvent(display,&ev);
+        syslog(LOG_ERR,"ev.type = %d",ev.type);
+        switch (ev.type) {
+        case KeyPress:
+            if (ev.xkey.time < timeout) {
+                XBell(display,0);
+                break;
+            }
+            clen= XLookupString(&ev.xkey,cbuf,9,&ks,0);
+            switch (ks) {
+            case XK_Escape:
+            case XK_Clear:
+            	resetState();
+                syslog(LOG_DEBUG,"clear");
+                break;
+            case XK_Delete:
+            case XK_BackSpace: //parameters.modes == e_MultiUsers
+                if (rlen>0) rlen--;
+                if (0 == rlen) {
+                	if (LoginName == programState) {
+                		resetState();
+                	}
+                	syslog(LOG_DEBUG,"cleared");
+                }
+                break;
+            case XK_Linefeed:
+            case XK_Return:
+            	if (rlen) {
+            		rbuf[rlen] = '\0';
+            		if (LoginName == programState) {
+            			user.login = rbuf;
+            			rbuf = password;
+            			rlen = 0;
+            			programState = nextState(programState);
+            			set_cursor(display, (event_mask)&0,programState);
+            		} else if (Password == programState) {
+            			int error = EXIT_SUCCESS;
+            			user.password = rbuf;
+            			error = authenticate(&user);
+            			clear_buffer(password,sizeof(password));
+            			log_session_access(user.login, EXIT_SUCCESS == error);
+            			if (EXIT_SUCCESS == error) {
+            				goto loop_x;
+            			}
+            			XBell(display,0);
+						rlen= 0;
+						if (timeout) {
+							goodwill+= ev.xkey.time - timeout;
+							if (goodwill > MAXGOODWILL) {
+								goodwill= MAXGOODWILL;
+							}
+						}
+						timeout= -goodwill*GOODWILLPORTION;
+						goodwill+= timeout;
+						timeout+= ev.xkey.time + TIMEOUTPERATTEMPT;
+						resetState();
+            		}
+            	}
+                break;
+            default:
+                if (clen != 1) break;
+                if (Idle == programState) {
+                	programState = nextState(programState);
+                	set_cursor(display, (event_mask)&0,programState);
+                }
+                /* allow space for the trailing \0 */
+                if (rlen < (sizeof(rbuf) - 1)) {
+                    rbuf[rlen]=cbuf[0];
+                    rlen++;
+                }
+                break;
+            }
+            break;
+#if MULTITOUCH
+        case GenericEvent:
+            if (ev.xcookie.extension == xi_opcode &&
+                    XGetEventData(display,&ev.xcookie) &&
+                    ev.xcookie.evtype == XI_HierarchyChanged) {
+                handle_multitouch(cursor);
+            }
+            break;
+#endif
+        default:
+            break;
+        }
+    }
+loop_x:
+    closelog();
+    return error;
 }
