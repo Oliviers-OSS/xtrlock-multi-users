@@ -99,10 +99,13 @@ State nextState(const State state)
     return next;
 }
 
+#define SET_NEW_STORAGE_BUFFER(x)	rbuf = x; \
+		bufferSize = sizeof(x); \
+		rlen = 0
+
 #define resetState() \
 	programState = Idle; \
-	rbuf = loginName; \
-	rlen = 0; \
+	SET_NEW_STORAGE_BUFFER(loginName); \
     set_cursor(display, (event_mask)&0,programState);
 
 
@@ -382,7 +385,7 @@ int main(int argc, char **argv)
     int error = EXIT_SUCCESS;
     State programState = Idle;
     KeySym ks;
-    char cbuf[10];
+    char cbuf[256];
     int clen, rlen=0;
     long goodwill= INITIALGOODWILL, timeout= 0;
     XSetWindowAttributes attrib;
@@ -394,6 +397,7 @@ int main(int argc, char **argv)
     char loginName[LOGIN_NAME_MAX];
     char password[256];
     char *rbuf = loginName;
+    size_t bufferSize = sizeof(loginName);
     char *display_name = getenv("DISPLAY");
 
 #ifdef SHADOW_PWD
@@ -560,9 +564,13 @@ int main(int argc, char **argv)
     log_session_lock();
     for (;;) {
         XEvent ev;
-        syslog(LOG_ERR,"waiting events.... ");
+#ifdef FULL_DEBUG
+        syslog(LOG_DEBUG,"waiting events.... ");
+#endif
         XNextEvent(display,&ev);
-        syslog(LOG_ERR,"ev.type = %d",ev.type);
+#ifdef FULL_DEBUG
+        syslog(LOG_DEBUG,"ev.type = %d",ev.type);
+#endif
         switch (ev.type) {
         case KeyPress:
             if (ev.xkey.time < timeout) {
@@ -577,7 +585,7 @@ int main(int argc, char **argv)
                 syslog(LOG_DEBUG,"clear");
                 break;
             case XK_Delete:
-            case XK_BackSpace: //parameters.modes == e_MultiUsers
+            case XK_BackSpace:
                 if (rlen>0) rlen--;
                 if (0 == rlen) {
                     if (LoginName == programState) {
@@ -592,13 +600,19 @@ int main(int argc, char **argv)
                     rbuf[rlen] = '\0';
                     if (LoginName == programState) {
                         user.login = rbuf;
-                        rbuf = password;
-                        rlen = 0;
+#ifdef DUMP_CREDENTIALS
+                        syslog(LOG_DEBUG,"Login name = %s",user.login);
+#endif
+                        SET_NEW_STORAGE_BUFFER(password);
                         programState = nextState(programState);
                         set_cursor(display, (event_mask)&0,programState);
                     } else if (Password == programState) {
                         int error = EXIT_SUCCESS;
                         user.password = rbuf;
+#ifdef DUMP_CREDENTIALS
+                        syslog(LOG_DEBUG,"password = %s",user.password);
+#endif
+                        rlen = 0;
                         error = authenticate(&user);
                         clear_buffer(password,sizeof(password));
                         log_session_access(user.login, EXIT_SUCCESS == error);
@@ -606,7 +620,6 @@ int main(int argc, char **argv)
                             goto loop_x;
                         }
                         XBell(display,0);
-                        rlen= 0;
                         if (timeout) {
                             goodwill+= ev.xkey.time - timeout;
                             if (goodwill > MAXGOODWILL) {
@@ -634,11 +647,15 @@ int main(int argc, char **argv)
 
                     set_cursor(display, (event_mask)&0,programState);
                 }
-                /* allow space for the trailing \0 */
-                if (rlen < (sizeof(rbuf) - 1)) {
-                    rbuf[rlen]=cbuf[0];
-                    rlen++;
+
+
+                if (rlen < (bufferSize - 1)) { /* allow space for the trailing \0 */
+                	rbuf[rlen]=cbuf[0];
+                	 rlen++;
+                } else {
+                	syslog(LOG_ERR,"Storage buffer is too small to store the %s (limit = %zu)",stateToString(programState),bufferSize);
                 }
+
                 break;
             }
             break;

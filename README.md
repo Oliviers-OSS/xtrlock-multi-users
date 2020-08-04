@@ -37,4 +37,3 @@ You may use the xautolock program or equivalent, for example:
 xautolock -time 5 -locker "/usr/bin/X11/xtrlock -u"
 will start the xtrlock software in multi-users mode if there is no user activity during the last 5 minutes.
 
-
